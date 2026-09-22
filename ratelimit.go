@@ -34,7 +34,10 @@ func NewLimiter(rate float64, burst int) *Limiter {
 // Wait 阻塞直到获得一个令牌或 ctx 取消。
 func (l *Limiter) Wait(ctx context.Context) error {
 	if l == nil || l.rate <= 0 {
-		return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return wrap(ErrKindCanceled, "Limiter.Wait", "已取消", err)
+		}
+		return nil
 	}
 	for {
 		l.mu.Lock()

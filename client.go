@@ -123,6 +123,10 @@ func (c *Client) FetchPage(ctx context.Context, cursor string) (*Page, error) {
 
 		resp, err := c.transport.Do(ctx, req)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// 由取消/超时导致的传输失败归为 canceled。
+				return nil, wrap(ErrKindCanceled, op, "传输期间被取消", ctxErr)
+			}
 			// 传输层异常统一归为可重试的临时失败，不向调用方透出原始类型。
 			lastErr = wrap(ErrKindTransient, op, "传输失败", err)
 		} else {
