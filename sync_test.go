@@ -139,8 +139,8 @@ func TestSync_ServerCursorRegressionRejected(t *testing.T) {
 	// 服务端在第二页返回不前进的游标（序号原地踏步）。
 	cur1 := EncodeCursor(Cursor{Seq: 1, Token: "t1"})
 	pages := map[string]*Page{
-		"":    {Cursor: cur1, Items: []json.RawMessage{json.RawMessage(`"a"`)}},
-		cur1:  {Cursor: cur1, Items: []json.RawMessage{json.RawMessage(`"b"`)}},
+		"":   {Cursor: cur1, Items: []json.RawMessage{json.RawMessage(`"a"`)}},
+		cur1: {Cursor: cur1, Items: []json.RawMessage{json.RawMessage(`"b"`)}},
 	}
 	ft := newFakeTransport(pages)
 	c := NewClient(ft, WithBackoff(testBackoff(2)))
