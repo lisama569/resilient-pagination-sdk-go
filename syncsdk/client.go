@@ -108,11 +108,26 @@ func (c *Client) backoff(ctx context.Context, attempt int) error {
 // FetchPage 抓取一页：限流、并发上限、退避重试、错误归一化。
 // 重试使用同一游标，幂等，不产生重复数据或重复副作用。
 func (c *Client) FetchPage(ctx context.Context, cursor string) (*Page, error) {
+	return c.FetchPageOn(ctx, "", cursor, nil)
+}
+
+// FetchPageOn 与 FetchPage 语义一致，但通过流专属传输层 st 发送；
+// st 为 nil 时退化为客户端共享的 Transport（stream 参数被忽略）。
+// 无论哪种方式都走同一个并发信号量与限流器，因此多流并行时
+// 整体并发与请求速率仍不超过 Client 的配置上限。
+func (c *Client) FetchPageOn(ctx context.Context, stream StreamID, cursor string, st StreamTransport) (*Page, error) {
 	select {
 	case c.sem <- struct{}{}:
 		defer func() { <-c.sem }()
 	case <-ctx.Done():
 		return nil, &Error{Kind: KindCanceled, Message: "canceled while waiting for concurrency slot", Cause: ctx.Err()}
+	}
+
+	doFetch := func(ctx context.Context) ([]byte, error) {
+		if st != nil {
+			return st.Fetch(ctx, stream, cursor)
+		}
+		return c.t.Fetch(ctx, cursor)
 	}
 
 	var lastErr error
@@ -125,7 +140,7 @@ func (c *Client) FetchPage(ctx context.Context, cursor string) (*Page, error) {
 		if err := c.waitRate(ctx); err != nil {
 			return nil, err
 		}
-		body, err := c.t.Fetch(ctx, cursor)
+		body, err := doFetch(ctx)
 		if err != nil {
 			var re *RetryableError
 			if errors.As(err, &re) {
