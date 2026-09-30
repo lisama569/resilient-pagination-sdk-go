@@ -21,6 +21,8 @@ const (
 	KindCanceled Kind = "canceled"
 	// KindTransport 底层传输失败（不直接向调用方透出原始错误）。
 	KindTransport Kind = "transport"
+	// KindCheckpointCorrupt 持久化进度损坏、被篡改或与此前内容对不上。
+	KindCheckpointCorrupt Kind = "checkpoint_corrupt"
 )
 
 // Error 是 SDK 归一化后的错误，底层解析/传输异常被包装在 Cause 中，
@@ -29,13 +31,19 @@ type Error struct {
 	Kind    Kind
 	Message string
 	Cause   error
+	// Stream 标识多流场景下出错的数据流；单流场景为空。
+	Stream StreamID
 }
 
 func (e *Error) Error() string {
-	if e.Cause != nil {
-		return string(e.Kind) + ": " + e.Message + ": " + e.Cause.Error()
+	prefix := string(e.Kind)
+	if e.Stream != "" {
+		prefix += "[" + string(e.Stream) + "]"
 	}
-	return string(e.Kind) + ": " + e.Message
+	if e.Cause != nil {
+		return prefix + ": " + e.Message + ": " + e.Cause.Error()
+	}
+	return prefix + ": " + e.Message
 }
 
 func (e *Error) Unwrap() error { return e.Cause }

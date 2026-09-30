@@ -9,6 +9,8 @@ type Result struct {
 	Items      []Item
 	Checkpoint *Checkpoint
 	Completed  bool // true 表示抓到了最后一页
+	// Stop 是可区分的结束原因；单流 Run 默认填 StopCompleted/StopCanceled/StopFailed。
+	Stop StopReason
 }
 
 // Syncer 编排分页抓取与检查点推进。
@@ -34,6 +36,9 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 	}
 	if cp == nil {
 		cp = &Checkpoint{}
+	} else if cp.Cursor == "" && cp.Seq > 0 {
+		// 已持久化完成终态：重启不再抓取，直接返回完成。
+		return &Result{Checkpoint: &Checkpoint{Cursor: "", Seq: cp.Seq}, Completed: true, Stop: StopCompleted}, nil
 	}
 	// 恢复前校验：持久化的游标本身必须合法。
 	if cp.Cursor != "" {
@@ -51,6 +56,11 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 		page, err := s.client.FetchPage(ctx, cursor)
 		if err != nil {
 			// 已提交页的进度已持久化，安全返回部分结果。
+			if IsKind(err, KindCanceled) {
+				res.Stop = StopCanceled
+			} else {
+				res.Stop = StopFailed
+			}
 			return res, err
 		}
 
@@ -67,6 +77,7 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 		// 顺序语义：先提交数据，成功后才能推进检查点。
 		if s.Commit != nil && len(fresh) > 0 {
 			if err := s.Commit(ctx, fresh); err != nil {
+				res.Stop = StopFailed
 				return res, &Error{Kind: KindTransport, Message: "commit failed", Cause: err}
 			}
 		}
@@ -77,16 +88,19 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 		if page.NextCursor != "" {
 			// 游标回退或失效必须显式拒绝，不得从中间继续。
 			if err := ValidateResume(&Checkpoint{Cursor: cursor, Seq: res.Checkpoint.Seq}, next); err != nil {
+				res.Stop = StopFailed
 				return res, err
 			}
 		}
 		if err := s.store.Save(ctx, next); err != nil {
+			res.Stop = StopFailed
 			return res, &Error{Kind: KindTransport, Message: "save checkpoint failed", Cause: err}
 		}
 		res.Checkpoint = next
 
 		if page.NextCursor == "" {
 			res.Completed = true
+			res.Stop = StopCompleted
 			return res, nil
 		}
 		cursor = page.NextCursor

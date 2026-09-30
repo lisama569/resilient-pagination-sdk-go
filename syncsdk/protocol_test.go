@@ -17,9 +17,9 @@ func TestParsePageVersionMismatch(t *testing.T) {
 
 func TestParsePageMissingField(t *testing.T) {
 	cases := []string{
-		`{"items":[],"next_cursor":""}`,          // 缺 version
-		`{"version":2,"next_cursor":""}`,        // 缺 items
-		`{"version":2,"items":[]}`,              // 缺 next_cursor
+		`{"items":[],"next_cursor":""}`,                        // 缺 version
+		`{"version":2,"next_cursor":""}`,                       // 缺 items
+		`{"version":2,"items":[]}`,                             // 缺 next_cursor
 		`{"version":2,"items":[{"data":{}}],"next_cursor":""}`, // item 缺 id
 	}
 	for _, input := range cases {

@@ -88,3 +88,28 @@ func ValidateResume(last *Checkpoint, next *Checkpoint) error {
 	}
 	return nil
 }
+
+// ValidateSave 是存储侧落盘前的单调推进校验，比 ValidateResume 多接受一种合法终态：
+// next.Cursor 为空表示“已抓到尾页、整条流完成”，只要序列号不倒退即可落盘，
+// 不应被当成游标回退。任何真正的回退（seq 倒退、或非空游标偏移倒退/失效）仍被拒绝。
+func ValidateSave(last *Checkpoint, next *Checkpoint) error {
+	if last == nil {
+		if next != nil && next.Cursor != "" {
+			_, _, err := DecodeCursor(next.Cursor)
+			return err
+		}
+		return nil
+	}
+	if next == nil {
+		return &Error{Kind: KindCursorInvalid, Message: "save nil checkpoint"}
+	}
+	if next.Seq < last.Seq {
+		return &Error{Kind: KindCursorInvalid,
+			Message: fmt.Sprintf("sequence regression: %d < %d", next.Seq, last.Seq)}
+	}
+	// 空游标 = 完成终态：seq 未倒退即合法（seq 相等也允许，例如空尾页）。
+	if next.Cursor == "" {
+		return nil
+	}
+	return ValidateResume(last, next)
+}
