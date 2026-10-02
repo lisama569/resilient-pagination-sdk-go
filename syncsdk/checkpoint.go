@@ -21,6 +21,14 @@ type CheckpointStore interface {
 	Save(ctx context.Context, cp *Checkpoint) error
 }
 
+// IsCheckpointCompleted 判定一个从存储读回的检查点是否处于“已抓到尾页”
+// 的完成态：Load 返回 nil 表示尚无任何落盘进度（首次运行），不属于完成；
+// 非 nil 且 Cursor 为空表示尾页已确认落盘，即为完成态。
+// 完成态是终态：重启后必须直接按“已完成”复用，不得再发起抓取或被覆盖。
+func IsCheckpointCompleted(cp *Checkpoint) bool {
+	return cp != nil && cp.Cursor == ""
+}
+
 // 游标格式：v<version>.<offset>.<crc32 校验和>，对调用方不透明。
 func cursorPayload(version, offset int) string {
 	return fmt.Sprintf("v%d.%d", version, offset)

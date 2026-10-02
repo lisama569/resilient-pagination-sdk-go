@@ -32,6 +32,12 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, &Error{Kind: KindTransport, Message: "load checkpoint failed", Cause: err}
 	}
+	// 完成态复用：上一轮已抓到尾页并落盘时，重启后直接按“已完成”返回，
+	// 不再发起抓取、不再重复提交已确认数据、不覆盖已落盘的终态进度，
+	// 返回的进度必须与重启前完全一致。
+	if IsCheckpointCompleted(cp) {
+		return &Result{Items: nil, Checkpoint: &Checkpoint{Cursor: cp.Cursor, Seq: cp.Seq}, Completed: true}, nil
+	}
 	if cp == nil {
 		cp = &Checkpoint{}
 	}

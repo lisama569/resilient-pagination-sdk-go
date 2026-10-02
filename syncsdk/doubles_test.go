@@ -111,8 +111,10 @@ func (m *memStore) Load(ctx context.Context) (*Checkpoint, error) {
 func (m *memStore) Save(ctx context.Context, cp *Checkpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.rejectRegress && m.cp != nil && m.cp.Cursor != "" {
-		if err := ValidateResume(m.cp, cp); err != nil {
+	if m.rejectRegress && m.cp != nil {
+		// 与 FileStore 同一套单调性/终态规则：完成态（空游标）是终态，
+		// 回退到中途游标或改变已完成 seq 都拒绝，防止替身放过真实存储会拦的进度。
+		if err := monotonic(m.cp, cp); err != nil {
 			return err
 		}
 	}

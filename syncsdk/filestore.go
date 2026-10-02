@@ -74,14 +74,30 @@ func envelopeChecksum(env *checkpointEnvelope) (string, error) {
 
 // monotonic 判定候选检查点相对已观测高水位是否为合法推进。
 // 与通用的 ValidateResume 不同，空游标在这里表示“已抓到尾页”的完成态，
-// 只要 seq 严格前进即为合法；任何回退都归为 checkpoint_corrupt。
-// 候选游标自身格式非法（不可解码）仍保持 cursor_invalid，由调用方先行校验。
+// 是终态：
+//   - 中途 -> 完成：seq 必须严格前进，防止中途进度被空游标平白覆盖；
+//   - 完成 -> 任何中途游标：拒绝，已完成的流不得被回退后重抓；
+//   - 完成 -> 完成：仅允许完全相同（同 seq）的终态重写（幂等重放），
+//     seq 变大或变小都拒绝。
+//
+// 任何回退都归为 checkpoint_corrupt。候选游标自身格式非法（不可解码）
+// 仍保持 cursor_invalid，由调用方先行校验。
 func monotonic(last, next *Checkpoint) error {
-	if last == nil || last.Cursor == "" {
-		return nil // 首次运行或基线已完成，无回退可言
+	if last == nil {
+		return nil // 首次见到进度，无回退可言
 	}
 	if next == nil {
 		return corrupt("checkpoint regressed to nil")
+	}
+	if last.Cursor == "" {
+		// 基线已是完成态（终态）：只接受完全相同的完成态重写。
+		if next.Cursor != "" {
+			return corrupt("completed checkpoint must not regress to an offset cursor")
+		}
+		if next.Seq != last.Seq {
+			return corrupt("completed checkpoint seq changed: %d != %d", next.Seq, last.Seq)
+		}
+		return nil
 	}
 	if next.Seq < last.Seq {
 		return corrupt("sequence regression: %d < %d", next.Seq, last.Seq)

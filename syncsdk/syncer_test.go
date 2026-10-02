@@ -119,6 +119,48 @@ func TestSyncerCursorRegressionRejected(t *testing.T) {
 	}
 }
 
+// TestSyncerCompletedStreamNotReplayedAfterRestart 覆盖单流路径：
+// 上一轮已完整跑到尾页（落盘空游标完成态）后，“重启”出全新 transport/client/syncer，
+// 必须直接按已完成处理——零抓取、零提交、返回进度与重启前完全一致，不翻倍。
+func TestSyncerCompletedStreamNotReplayedAfterRestart(t *testing.T) {
+	cfg := Config{RatePerSecond: 1000, MaxRetries: 1, InitialBackoff: time.Millisecond}
+
+	// 第一次：完整跑完 6 条。
+	ft1 := newFakeTransport()
+	setupPages(ft1, 2, 6)
+	store := &memStore{rejectRegress: true}
+	sink := newCommitLog()
+	s1 := NewSyncer(NewClient(ft1, cfg), store, sink.commit)
+	res1, err1 := s1.Run(context.Background())
+	t.Logf("run1: completed=%v items=%d seq=%d err=%v", res1.Completed, len(res1.Items), res1.Checkpoint.Seq, err1)
+	if err1 != nil || !res1.Completed || res1.Checkpoint.Seq != 6 {
+		t.Fatalf("run1 should complete with seq=6, got completed=%v seq=%d err=%v",
+			res1.Completed, res1.Checkpoint.Seq, err1)
+	}
+
+	// “重启”：全新 transport（不预置任何页面，一旦被抓立刻暴露）、全新 client/syncer。
+	ft2 := newFakeTransport()
+	s2 := NewSyncer(NewClient(ft2, cfg), store, sink.commit)
+	res2, err2 := s2.Run(context.Background())
+	t.Logf("run2: completed=%v items=%d seq=%d totalCommitted=%d fetchCalls=%d err=%v",
+		res2.Completed, len(res2.Items), res2.Checkpoint.Seq, len(sink.ids), ft2.totalCalls(), err2)
+	if err2 != nil || !res2.Completed {
+		t.Fatalf("completed stream must be reused as completed, got completed=%v err=%v", res2.Completed, err2)
+	}
+	if ft2.totalCalls() != 0 {
+		t.Fatalf("completed stream must not be fetched after restart, got %d calls", ft2.totalCalls())
+	}
+	if len(res2.Items) != 0 {
+		t.Fatalf("completed stream must not re-commit items, got %d", len(res2.Items))
+	}
+	if res2.Checkpoint.Seq != 6 {
+		t.Fatalf("progress must be identical to pre-restart (6), got %d", res2.Checkpoint.Seq)
+	}
+	if len(sink.ids) != 6 {
+		t.Fatalf("no item may be committed twice: want 6 unique, got %d (%v)", len(sink.ids), sink.ids)
+	}
+}
+
 func TestSyncerCursorInvalidRejected(t *testing.T) {
 	cases := []string{
 		"garbage",

@@ -156,6 +156,15 @@ func runStream(parent context.Context, client *Client, sc StreamConfig) StreamRe
 		res.Err = tag(err, sc.ID)
 		return res
 	}
+	// 完成态复用：空游标表示尾页已确认落盘（load 非 nil）。重启后该流
+	// 直接按“已完成”处理——不启动抓取协程、不发起任何抓取、不重复提交、
+	// 不覆盖已落盘进度，返回的进度与重启前完全一致。其他流互不影响。
+	// 必须在 nil（无落盘文件=首次运行）被补成空 Checkpoint 之前判断。
+	if IsCheckpointCompleted(load) {
+		res.Reason = StopCompleted
+		res.Checkpoint = &Checkpoint{Cursor: load.Cursor, Seq: load.Seq}
+		return res
+	}
 	if load == nil {
 		load = &Checkpoint{}
 	}

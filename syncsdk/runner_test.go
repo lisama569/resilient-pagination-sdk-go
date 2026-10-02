@@ -3,6 +3,7 @@ package syncsdk
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -617,4 +618,158 @@ func TestRunnerTimeoutReturnsPartialProgress(t *testing.T) {
 	if res.Checkpoint.Seq == 0 || res.Checkpoint.Seq != uint64(len(sink.ids)) {
 		t.Fatalf("partial progress inconsistent: cpSeq=%d committed=%d", res.Checkpoint.Seq, len(sink.ids))
 	}
+}
+
+// readFileBytes 读取落盘检查点的原始字节，用于断言“已完成流的进度文件未被重写”。
+func readFileBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read checkpoint file %s: %v", path, err)
+	}
+	return b
+}
+
+// TestRunnerRestartReusesCompletedStreams 稳定覆盖“部分完成后重启”场景：
+// 重启前同一批流分别处于——users 已完整跑完成、orders 跑到一半、billing
+// 失败退出；随后用全新 client/runner（只共享磁盘检查点与幂等 sink）重启。
+// 断言：已完成流不再被抓取、不重复提交、落盘进度与文件字节完全不变；
+// 未完成/失败流各按各自落盘进度继续；整体不丢不重。
+func TestRunnerRestartReusesCompletedStreams(t *testing.T) {
+	dir := t.TempDir()
+	ordersPath := dir + "/orders.json"
+	billingPath := dir + "/billing.json"
+	usersPath := dir + "/users.json"
+
+	sink := newCommitLog() // 跨“重启”共享的幂等提交端
+	cfg := Config{MaxConcurrency: 4, RatePerSecond: 1000, MaxRetries: 1,
+		InitialBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond}
+
+	makeCfgs := func() []StreamConfig {
+		stOrders, _ := NewFileStore(ordersPath, "orders")
+		stBilling, _ := NewFileStore(billingPath, "billing")
+		stUsers, _ := NewFileStore(usersPath, "users")
+		return []StreamConfig{
+			{ID: "orders", Store: stOrders, Commit: sink.commit, MaxInFlight: 1},
+			{ID: "billing", Store: stBilling, Commit: sink.commit, MaxInFlight: 1},
+			{ID: "users", Store: stUsers, Commit: sink.commit, MaxInFlight: 1},
+		}
+	}
+
+	// ---- 阶段 1：users 流完整跑到尾页（orders/billing 未参与）。----
+	srvA := newStreamServer()
+	srvA.setupStream("users", 2, 6) // 3 页，共 6 条
+	rA := mustRunner(t, NewClient(unusedSharedTransport{}, cfg),
+		withStreamTransport([]StreamConfig{makeCfgs()[2]}, srvA))
+	resA := rA.Run(context.Background())
+	if resA[0].Reason != StopCompleted {
+		t.Fatalf("[phase1] users should complete, got %s/%v", resA[0].Reason, resA[0].Err)
+	}
+	usersCompletedBytes := readFileBytes(t, usersPath)
+	t.Logf("[phase1] users completed: seq=%d checkpointFile=%s", resA[0].Checkpoint.Seq, usersCompletedBytes)
+
+	// ---- 阶段 2：orders 跑到第二页失败，仅首页(4 条)确认落盘；billing 失败，仅首页(2 条)确认。----
+	srvB := newStreamServer()
+	srvB.setupStream("orders", 4, 10) // 3 页：4 + 4 + 2
+	srvB.setupStream("billing", 2, 8) // 4 页：2 x 4
+	srvB.injectFailure("orders", EncodeCursor(4, 2), fmt.Errorf("boom"), fmt.Errorf("boom"))
+	srvB.injectFailure("billing", EncodeCursor(2, 2), fmt.Errorf("boom"), fmt.Errorf("boom"))
+	cfgsB := makeCfgs()
+	rB := mustRunner(t, NewClient(unusedSharedTransport{}, cfg), withStreamTransport(cfgsB, srvB))
+	resB := rB.Run(context.Background())
+	byID := map[StreamID]StreamResult{}
+	for _, res := range resB {
+		byID[res.Stream] = res
+		t.Logf("[phase2] stream=%s reason=%s kind=%s committedItems=%d cpSeq=%d",
+			res.Stream, res.Reason, KindOf(res.Err), len(res.Items), res.Checkpoint.Seq)
+	}
+	if byID["orders"].Reason != StopFailed || byID["orders"].Checkpoint.Seq != 4 {
+		t.Fatalf("[phase2] orders should fail with seq=4, got reason=%s seq=%d",
+			byID["orders"].Reason, byID["orders"].Checkpoint.Seq)
+	}
+	if byID["billing"].Reason != StopFailed || byID["billing"].Checkpoint.Seq != 2 {
+		t.Fatalf("[phase2] billing should fail with seq=2, got reason=%s seq=%d",
+			byID["billing"].Reason, byID["billing"].Checkpoint.Seq)
+	}
+	if byID["users"].Reason != StopCompleted {
+		t.Fatalf("[phase2] users (already on disk as completed) must stay completed, got %s/%v",
+			byID["users"].Reason, byID["users"].Err)
+	}
+	// 阶段 2 已经是一次“同进程内复用”：users 不应被抓取，进度文件不变。
+	if srvB.callsFor("users") != 0 {
+		t.Fatalf("[phase2] completed users stream was re-fetched: %d calls", srvB.callsFor("users"))
+	}
+	if got := readFileBytes(t, usersPath); !bytesEqual(got, usersCompletedBytes) {
+		t.Fatalf("[phase2] users checkpoint file was rewritten:\n before=%s\n after =%s", usersCompletedBytes, got)
+	}
+
+	// ---- 阶段 3：真正的“进程重启”——全新服务、全新 client、全新 runner/FileStore，
+	// 只靠磁盘文件与幂等 sink。三条流一起跑。----
+	srvC := newStreamServer()
+	srvC.setupStream("orders", 4, 10)
+	srvC.setupStream("billing", 2, 8)
+	srvC.setupStream("users", 2, 6)
+	rC := mustRunner(t, NewClient(unusedSharedTransport{}, cfg), withStreamTransport(makeCfgs(), srvC))
+	resC := rC.Run(context.Background())
+	for _, res := range resC {
+		t.Logf("[restart] stream=%s reason=%s kind=%s committedItems(this run)=%d cpSeq=%d",
+			res.Stream, res.Reason, KindOf(res.Err), len(res.Items), res.Checkpoint.Seq)
+		if res.Reason != StopCompleted {
+			t.Fatalf("[restart] stream %s should complete, got %s/%v", res.Stream, res.Reason, res.Err)
+		}
+	}
+
+	// 已完成流：重启后零抓取、零本次提交、返回进度与重启前完全一致。
+	if n := srvC.callsFor("users"); n != 0 {
+		t.Fatalf("[restart] completed users stream must not be fetched, got %d calls", n)
+	}
+	usersRes := resC[2]
+	if usersRes.Checkpoint == nil || usersRes.Checkpoint.Cursor != "" || usersRes.Checkpoint.Seq != 6 {
+		t.Fatalf("[restart] users checkpoint must be the preserved completed one, got %+v", usersRes.Checkpoint)
+	}
+	if len(usersRes.Items) != 0 {
+		t.Fatalf("[restart] completed users stream must not re-commit items, got %d", len(usersRes.Items))
+	}
+	if got := readFileBytes(t, usersPath); !bytesEqual(got, usersCompletedBytes) {
+		t.Fatalf("[restart] users checkpoint file changed despite being completed:\n before=%s\n after =%s",
+			usersCompletedBytes, got)
+	}
+
+	// 未完成/失败流：各按各的落盘进度继续，服务侧只从恢复游标开始抓。
+	// orders 首页 4 条已确认 -> 只剩 2 次抓取（offset4 页 + 尾页）。
+	if n := srvC.callsFor("orders"); n != 2 {
+		t.Fatalf("[restart] orders should resume with 2 fetches, got %d", n)
+	}
+	// billing 首页 2 条已确认 -> 只剩 3 次抓取（offset2/4/6）。
+	if n := srvC.callsFor("billing"); n != 3 {
+		t.Fatalf("[restart] billing should resume with 3 fetches, got %d", n)
+	}
+
+	// 整体不丢不重：orders 10 + billing 8 + users 6 = 24 个唯一 ID。
+	if len(sink.ids) != 24 {
+		t.Fatalf("[restart] want 24 unique committed items (no dup/no loss), got %d: %v", len(sink.ids), sink.ids)
+	}
+	for _, want := range []string{
+		"orders-id-000", "orders-id-009",
+		"billing-id-000", "billing-id-007",
+		"users-id-000", "users-id-005",
+	} {
+		if !sink.seen[want] {
+			t.Fatalf("[restart] missing expected item %s", want)
+		}
+	}
+	t.Logf("[restart] all streams done; total unique committed=%d; users untouched (0 fetch, file unchanged)",
+		len(sink.ids))
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -179,3 +179,67 @@ func TestFileStoreRejectsInvalidCursor(t *testing.T) {
 		t.Fatalf("saving invalid cursor must fail as cursor_invalid, got %v", err)
 	}
 }
+
+// TestFileStoreCompletedIsTerminalAndReloadable 覆盖完成态（空游标）语义：
+//   - 合法的完成态落盘后，必须能被新实例正确读回并识别为“已完成”，
+//     不得被误判成损坏/回退，也不得被当成未完成；
+//   - 完成态是终态：回退到中途游标、改变 seq 都必须拒绝；
+//   - 完全相同的完成态允许幂等重写（防御性重放不报错）。
+func TestFileStoreCompletedIsTerminalAndReloadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "orders.json")
+
+	// 先推进到中途，再推进到完成态（seq 严格前进）。
+	s1, _ := NewFileStore(path, "orders")
+	if err := s1.Save(context.Background(), &Checkpoint{Cursor: EncodeCursor(4, 2), Seq: 4}); err != nil {
+		t.Fatal(err)
+	}
+	done := &Checkpoint{Cursor: "", Seq: 6}
+	if err := s1.Save(context.Background(), done); err != nil {
+		t.Fatalf("advance to completed must succeed, got %v", err)
+	}
+
+	// 新实例只靠磁盘读回：合法完成态必须被识别，不能报错。
+	s2, _ := NewFileStore(path, "orders")
+	got, err := s2.Load(context.Background())
+	t.Logf("reload completed checkpoint: %+v err=%v", got, err)
+	if err != nil {
+		t.Fatalf("legitimate completed checkpoint must reload without error, got %v", err)
+	}
+	if !IsCheckpointCompleted(got) {
+		t.Fatalf("empty-cursor checkpoint must be recognized as completed, got %+v", got)
+	}
+	if got.Seq != 6 {
+		t.Fatalf("completed checkpoint seq=%d want 6", got.Seq)
+	}
+
+	// 完成态 -> 中途游标：拒绝（不能回退后重抓）。
+	mid := &Checkpoint{Cursor: EncodeCursor(4, 2), Seq: 4}
+	if err := s2.Save(context.Background(), mid); !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("completed -> mid checkpoint must be rejected as checkpoint_corrupt, got %v", err)
+	} else {
+		t.Logf("completed -> mid rejected: %v", err)
+	}
+
+	// 完成态 -> seq 变大的完成态（正是“重启翻倍”想写入的形态）：拒绝。
+	if err := s2.Save(context.Background(), &Checkpoint{Cursor: "", Seq: 12}); !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("completed -> larger seq must be rejected, got %v", err)
+	}
+	// 完成态 -> seq 变小同样拒绝。
+	if err := s2.Save(context.Background(), &Checkpoint{Cursor: "", Seq: 2}); !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("completed -> smaller seq must be rejected, got %v", err)
+	}
+
+	// 完全相同的完成态幂等重写：允许（不推进 gen 之外不应报错）。
+	if err := s2.Save(context.Background(), &Checkpoint{Cursor: "", Seq: 6}); err != nil {
+		t.Fatalf("idempotent rewrite of identical completed checkpoint must succeed, got %v", err)
+	}
+
+	// 磁盘被换成“完成态回退成中途”的旧文件：已观测到完成态高水位的实例
+	// 再次 Load 时必须拒绝（gen 更旧/游标回退都不能当成正常进度）。
+	writeEnvelopeFile(t, path, "orders", EncodeCursor(4, 2), 4, 1, nil)
+	if _, err := s2.Load(context.Background()); !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("reading a regressed (completed -> mid) checkpoint must fail, got %v", err)
+	} else {
+		t.Logf("regressed-on-disk completed checkpoint rejected: %v", err)
+	}
+}
