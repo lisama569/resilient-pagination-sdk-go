@@ -41,8 +41,12 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 			return nil, err
 		}
 	}
+	// 落盘进度已是完成态：直接复用，不再抓取、不再重复提交。
+	if cp.Done {
+		return &Result{Checkpoint: &Checkpoint{Cursor: cp.Cursor, Seq: cp.Seq, Done: true}, Completed: true}, nil
+	}
 
-	res := &Result{Checkpoint: &Checkpoint{Cursor: cp.Cursor, Seq: cp.Seq}}
+	res := &Result{Checkpoint: &Checkpoint{Cursor: cp.Cursor, Seq: cp.Seq, Done: cp.Done}}
 	seen := map[string]bool{}
 	cursor := cp.Cursor
 	seq := cp.Seq
@@ -73,7 +77,7 @@ func (s *Syncer) Run(ctx context.Context) (*Result, error) {
 		seq += uint64(len(fresh))
 		res.Items = append(res.Items, fresh...)
 
-		next := &Checkpoint{Cursor: page.NextCursor, Seq: seq}
+		next := &Checkpoint{Cursor: page.NextCursor, Seq: seq, Done: page.NextCursor == ""}
 		if page.NextCursor != "" {
 			// 游标回退或失效必须显式拒绝，不得从中间继续。
 			if err := ValidateResume(&Checkpoint{Cursor: cursor, Seq: res.Checkpoint.Seq}, next); err != nil {

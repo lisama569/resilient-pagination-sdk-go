@@ -179,3 +179,66 @@ func TestFileStoreRejectsInvalidCursor(t *testing.T) {
 		t.Fatalf("saving invalid cursor must fail as cursor_invalid, got %v", err)
 	}
 }
+
+func TestFileStoreDoneCheckpointRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cp.json")
+	s, _ := NewFileStore(path, "orders")
+
+	// 完成态落盘 -> 读回仍是完成态，进度不变。
+	done := &Checkpoint{Cursor: "", Seq: 6, Done: true}
+	if err := s.Save(context.Background(), done); err != nil {
+		t.Fatalf("save done checkpoint: %v", err)
+	}
+	got, err := s.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load done checkpoint: %v", err)
+	}
+	t.Logf("done checkpoint round trip: seq=%d done=%v", got.Seq, got.Done)
+	if !got.Done || got.Seq != 6 || got.Cursor != "" {
+		t.Fatalf("done checkpoint not preserved: %+v", got)
+	}
+
+	// 完成态是终态：同进程内任何改动（重抓、覆盖、回退）都被拒绝。
+	for _, cp := range []*Checkpoint{
+		{Cursor: EncodeCursor(2, 2), Seq: 2}, // 回退到中途进度
+		{Cursor: "", Seq: 6},                 // 丢掉完成标记
+		{Cursor: "", Seq: 12, Done: true},    // 完成态上再叠加进度
+	} {
+		if err := s.Save(context.Background(), cp); !IsKind(err, KindCheckpointCorrupt) {
+			t.Fatalf("overwriting completed checkpoint must be rejected, got %v", err)
+		}
+	}
+	// 读回同一个完成检查点（重启后新实例的场景）是合法的。
+	s2, _ := NewFileStore(path, "orders")
+	got2, err := s2.Load(context.Background())
+	if err != nil || !got2.Done || got2.Seq != 6 {
+		t.Fatalf("fresh instance must read completed checkpoint as-is, got %+v err=%v", got2, err)
+	}
+}
+
+func TestFileStoreRejectsInconsistentDone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cp.json")
+	s, _ := NewFileStore(path, "orders")
+
+	// 完成态却携带下一页游标：自相矛盾，保存即拒绝。
+	bad := &Checkpoint{Cursor: EncodeCursor(2, 2), Seq: 2, Done: true}
+	if err := s.Save(context.Background(), bad); !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("done checkpoint with next cursor must be rejected, got %v", err)
+	}
+
+	// 磁盘上被篡改成“完成态+游标”：读回同样拒绝。
+	writeEnvelopeFile(t, path, "orders", EncodeCursor(2, 2), 2, 1, func(env *checkpointEnvelope) {
+		env.Done = true
+		sum, err := envelopeChecksum(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Checksum = sum
+	})
+	s2, _ := NewFileStore(path, "orders")
+	_, err := s2.Load(context.Background())
+	t.Logf("inconsistent done checkpoint -> %v (kind=%s)", err, KindOf(err))
+	if !IsKind(err, KindCheckpointCorrupt) {
+		t.Fatalf("tampered done checkpoint must be rejected, got %v", err)
+	}
+}

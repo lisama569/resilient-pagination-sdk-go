@@ -166,8 +166,15 @@ func runStream(parent context.Context, client *Client, sc StreamConfig) StreamRe
 			return res
 		}
 	}
+	// 重启恢复：落盘进度已是完成态的流直接按“已完成”处理——
+	// 不再发起抓取、不再重复提交，返回的进度与落盘值完全一致。
+	if load.Done {
+		res.Reason = StopCompleted
+		res.Checkpoint = &Checkpoint{Cursor: load.Cursor, Seq: load.Seq, Done: true}
+		return res
+	}
 
-	checkpoint := &Checkpoint{Cursor: load.Cursor, Seq: load.Seq}
+	checkpoint := &Checkpoint{Cursor: load.Cursor, Seq: load.Seq, Done: load.Done}
 	res.Checkpoint = checkpoint
 
 	maxPages := sc.maxInFlight()
@@ -325,7 +332,7 @@ func runStream(parent context.Context, client *Client, sc StreamConfig) StreamRe
 			committed = append(committed, fresh...)
 			free(len(fresh))
 
-			next := &Checkpoint{Cursor: page.NextCursor, Seq: bp.seq}
+			next := &Checkpoint{Cursor: page.NextCursor, Seq: bp.seq, Done: page.NextCursor == ""}
 			if page.NextCursor != "" {
 				if verr := ValidateResume(checkpoint, next); verr != nil {
 					cancel()

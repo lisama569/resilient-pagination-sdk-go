@@ -10,8 +10,11 @@ import (
 
 // Checkpoint 记录已确认的同步进度。
 type Checkpoint struct {
-	Cursor string // 下一页游标；空串表示从头开始
+	Cursor string // 下一页游标；空串表示从头开始（Done=false）或已抓到尾页（Done=true）
 	Seq    uint64 // 已提交的条目数，用于顺序语义校验
+	// Done 为 true 表示该流已完整同步到尾页：恢复时直接按“已完成”处理，
+	// 不再发起抓取、不再重复提交，进度保持落盘时的值不变。
+	Done bool
 }
 
 // CheckpointStore 抽象检查点持久化，测试中用本地替身实现。

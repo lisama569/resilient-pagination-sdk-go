@@ -16,12 +16,13 @@ import (
 //
 // 落盘格式（JSON 信封）：
 //
-//	{"format":1,"stream":"<流标识>","cursor":"...","seq":N,"gen":M,"checksum":"<crc32>"}
+//	{"format":1,"stream":"<流标识>","cursor":"...","seq":N,"done":B,"gen":M,"checksum":"<crc32>"}
 //
 // checksum 覆盖除 checksum 外的全部字段（按固定字段序序列化），任何字节级
 // 篡改/截断都会在 Load 时被发现；stream 字段把文件与数据流绑定，A 流的进度
 // 文件不能被 B 流读走；gen 为单调递增的写入代际，配合已观测到的高水位，
-// 读回比之前更旧（倒退）的进度时显式拒绝。
+// 读回比之前更旧（倒退）的进度时显式拒绝；done 标记“已抓到尾页”的完成态，
+// 完成态是终态：恢复时直接复用，且不允许被任何进度覆盖。
 type FileStore struct {
 	path     string
 	streamID string
@@ -39,6 +40,7 @@ type checksumPayload struct {
 	Stream string `json:"stream"`
 	Cursor string `json:"cursor"`
 	Seq    uint64 `json:"seq"`
+	Done   bool   `json:"done"`
 	Gen    uint64 `json:"gen"`
 }
 
@@ -47,6 +49,7 @@ type checkpointEnvelope struct {
 	Stream   string `json:"stream"`
 	Cursor   string `json:"cursor"`
 	Seq      uint64 `json:"seq"`
+	Done     bool   `json:"done"`
 	Gen      uint64 `json:"gen"`
 	Checksum string `json:"checksum"`
 }
@@ -64,7 +67,7 @@ func corrupt(format string, args ...any) error {
 }
 
 func envelopeChecksum(env *checkpointEnvelope) (string, error) {
-	p := checksumPayload{Format: env.Format, Stream: env.Stream, Cursor: env.Cursor, Seq: env.Seq, Gen: env.Gen}
+	p := checksumPayload{Format: env.Format, Stream: env.Stream, Cursor: env.Cursor, Seq: env.Seq, Done: env.Done, Gen: env.Gen}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return "", &Error{Kind: KindCheckpointCorrupt, Message: "failed to encode checkpoint", Cause: err}
@@ -72,16 +75,36 @@ func envelopeChecksum(env *checkpointEnvelope) (string, error) {
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE(b)), nil
 }
 
+// validateShape 校验检查点自身形态：完成态不得携带下一页游标，
+// 否则视为损坏（完成于尾页与“还有下一页”互相矛盾）。
+func validateShape(cp *Checkpoint) error {
+	if cp.Done && cp.Cursor != "" {
+		return corrupt("completed checkpoint must not carry a next cursor")
+	}
+	return nil
+}
+
 // monotonic 判定候选检查点相对已观测高水位是否为合法推进。
 // 与通用的 ValidateResume 不同，空游标在这里表示“已抓到尾页”的完成态，
 // 只要 seq 严格前进即为合法；任何回退都归为 checkpoint_corrupt。
 // 候选游标自身格式非法（不可解码）仍保持 cursor_invalid，由调用方先行校验。
 func monotonic(last, next *Checkpoint) error {
-	if last == nil || last.Cursor == "" {
-		return nil // 首次运行或基线已完成，无回退可言
+	if last == nil {
+		return nil // 首次运行，无回退可言
 	}
 	if next == nil {
 		return corrupt("checkpoint regressed to nil")
+	}
+	if last.Done {
+		// 完成态是终态：只允许读回/写入同一个完成检查点，
+		// 任何改动（重抓、覆盖、回退）都显式拒绝。
+		if next.Done && next.Cursor == "" && next.Seq == last.Seq {
+			return nil
+		}
+		return corrupt("completed checkpoint must not be overwritten or regressed")
+	}
+	if last.Cursor == "" {
+		return nil // 尚未起步的基线，无回退可言
 	}
 	if next.Seq < last.Seq {
 		return corrupt("sequence regression: %d < %d", next.Seq, last.Seq)
@@ -131,7 +154,10 @@ func (s *FileStore) Load(ctx context.Context) (*Checkpoint, error) {
 	if env.Stream != s.streamID {
 		return nil, corrupt("checkpoint belongs to stream %q, refusing to resume stream %q", env.Stream, s.streamID)
 	}
-	cp := &Checkpoint{Cursor: env.Cursor, Seq: env.Seq}
+	cp := &Checkpoint{Cursor: env.Cursor, Seq: env.Seq, Done: env.Done}
+	if err := validateShape(cp); err != nil {
+		return nil, err
+	}
 	if cp.Cursor != "" {
 		if _, _, err := DecodeCursor(cp.Cursor); err != nil {
 			return nil, err
@@ -164,6 +190,9 @@ func (s *FileStore) Save(ctx context.Context, cp *Checkpoint) error {
 	if cp == nil {
 		return corrupt("cannot save nil checkpoint")
 	}
+	if err := validateShape(cp); err != nil {
+		return err
+	}
 	if cp.Cursor != "" {
 		if _, _, err := DecodeCursor(cp.Cursor); err != nil {
 			return err
@@ -183,6 +212,7 @@ func (s *FileStore) Save(ctx context.Context, cp *Checkpoint) error {
 		Stream: s.streamID,
 		Cursor: cp.Cursor,
 		Seq:    cp.Seq,
+		Done:   cp.Done,
 		Gen:    gen,
 	}
 	sum, err := envelopeChecksum(env)
